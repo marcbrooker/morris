@@ -88,10 +88,9 @@ Morris uses a fixed, deterministic workflow. The AI (via AWS Bedrock Converse AP
 │                                                             │
 │  5. 🧪 Testing Loop (deterministic)                         │
 │     For each mutation:                                      │
-│     ├─ Backup original file                                │
-│     ├─ Apply mutation to single line                       │
+│     ├─ Materialize structured mutation blocks               │
 │     ├─ Run tests (with 3x baseline timeout)                │
-│     └─ Restore original file                               │
+│     └─ Activate/deactivate each variant deterministically   │
 │                                                             │
 │  6. 📊 Results Summary (deterministic)                      │
 │     └─ Counts killed / survived / build errors             │
@@ -110,12 +109,12 @@ Morris uses a fixed, deterministic workflow. The AI (via AWS Bedrock Converse AP
 
 ## 🎛️ Command Line Options
 
-| Flag | Description | Use Case |
-|------|-------------|----------|
-| *(none)* | Default mode with Claude Sonnet 4.6 | Best quality analysis |
-| `--quick` | Use Claude Haiku 4.5 | Faster, less thorough |
-| `--auto` | Automatically apply test improvements | Hands-free mode |
-| `-v` / `--verbose` | Enable debug logging | Troubleshooting |
+| Flag               | Description                           | Use Case              |
+| ------------------ | ------------------------------------- | --------------------- |
+| *(none)*           | Default mode with Claude Sonnet 4.6   | Best quality analysis |
+| `--quick`          | Use Claude Haiku 4.5                  | Faster, less thorough |
+| `--auto`           | Automatically apply test improvements | Hands-free mode       |
+| `-v` / `--verbose` | Enable debug logging                  | Troubleshooting       |
 
 ### Examples
 
@@ -154,11 +153,11 @@ $ cargo morris
 
 🧪 Testing mutations...
 
-   [1/1] src/lib.rs:42 - Change > to <... ❌ SURVIVED
-   [2/2] src/lib.rs:67 - Change + to -... ❌ SURVIVED
-   [3/3] src/lib.rs:89 - Change == to !=... ✅ KILLED
-   [4/4] src/lib.rs:23 - Change >= to >... ✅ KILLED
-   [5/5] src/lib.rs:51 - Change true to false... ❌ SURVIVED
+   [1/6] src/lib.rs:42 - Change > to <... ❌ SURVIVED
+   [2/6] src/lib.rs:67 - Change + to -... ✅ KILLED
+   [3/6] src/lib.rs:89 - Change == to !=... ✅ KILLED
+   [4/6] src/lib.rs:23 - Change >= to >... ✅ KILLED
+   [5/6] src/lib.rs:51 - Change true to false... ❌ SURVIVED
    [6/6] src/lib.rs:15 - Remove bounds check... 🔧 BUILD ERROR
 
 📊 Results: 2 killed, 3 survived out of 5 testable mutations
@@ -258,4 +257,3 @@ Morris uses a fixed workflow with two targeted Bedrock Converse API calls. All f
 │                                                          │
 └──────────────────────────────────────────────────────────┘
 ```
-
