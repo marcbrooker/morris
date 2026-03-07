@@ -9,14 +9,17 @@ use aws_sdk_bedrockruntime::{
     types::{ContentBlock, ConversationRole, Message, SystemContentBlock},
 };
 use clap::Parser;
+use marauders::api as mutation_api;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tokio::process::Command;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 /// A single mutation proposed by the AI.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Mutation {
     file_path: String,
     line_number: usize,
@@ -118,16 +121,13 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Run `cargo test --quiet` and return (success, duration, output).
-async fn run_cargo_test(timeout: Duration) -> (bool, Duration, String) {
+/// Run a command with timeout and return (success, duration, combined_output).
+async fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> (bool, Duration, String) {
     let start = Instant::now();
-    let result = tokio::time::timeout(
-        timeout,
-        tokio::process::Command::new("cargo")
-            .args(["test", "--quiet"])
-            .output(),
-    )
-    .await;
+    let result = tokio::time::timeout(timeout, command.output()).await;
     let elapsed = start.elapsed();
 
     match result {
@@ -142,8 +142,16 @@ async fn run_cargo_test(timeout: Duration) -> (bool, Duration, String) {
     }
 }
 
+/// Run `cargo test --quiet` and return (success, duration, output).
+async fn run_cargo_test(cwd: &Path, timeout: Duration) -> (bool, Duration, String) {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(cwd).args(["test", "--quiet"]);
+    run_command_with_timeout(cmd, timeout).await
+}
+
 /// Apply a single-line mutation, test, and restore. Returns the outcome.
 async fn test_line_mutation(
+    cwd: &Path,
     file_path: &str,
     line_number: usize,
     original_line: &str,
@@ -198,7 +206,7 @@ async fn test_line_mutation(
     }
 
     // Test
-    let (success, _, output) = run_cargo_test(timeout).await;
+    let (success, _, output) = run_cargo_test(cwd, timeout).await;
 
     // Restore
     let _ = std::fs::copy(&backup_path, file_path);
@@ -341,6 +349,192 @@ fn build_mutation_prompt(file_contents: &str) -> String {
     )
 }
 
+fn to_display_path(cwd: &Path, file: &Path) -> String {
+    file.strip_prefix(cwd)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .to_string()
+}
+
+#[derive(Debug)]
+struct PreparedMutation {
+    index: usize,
+    mutation: Mutation,
+    variant_name: String,
+}
+
+#[derive(Debug)]
+struct FileMutationInjection {
+    target_line: usize,
+    block_lines: Vec<String>,
+}
+
+#[derive(Debug)]
+struct FileMutationState {
+    original: String,
+    lines: Vec<String>,
+    trailing_newline: bool,
+    injections: Vec<FileMutationInjection>,
+}
+
+#[derive(Debug)]
+struct PreparedMutationSuite {
+    backups: Vec<(PathBuf, String)>,
+    prepared: Vec<PreparedMutation>,
+    results: Vec<Option<MutationResult>>,
+}
+
+fn leading_whitespace(s: &str) -> &str {
+    let idx = s
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    &s[..idx]
+}
+
+fn prepare_mutation_suite(cwd: &Path, mutations: Vec<Mutation>) -> PreparedMutationSuite {
+    let mut file_states: BTreeMap<PathBuf, FileMutationState> = BTreeMap::new();
+    let mut prepared = Vec::new();
+    let mut results: Vec<Option<MutationResult>> = std::iter::repeat_with(|| None)
+        .take(mutations.len())
+        .collect();
+
+    for (idx, mutation) in mutations.into_iter().enumerate() {
+        let full_path = cwd.join(&mutation.file_path);
+        let state = file_states.entry(full_path.clone()).or_insert_with(|| {
+            let original = std::fs::read_to_string(&full_path).unwrap_or_default();
+            let trailing_newline = original.ends_with('\n');
+            let mut lines = original
+                .split('\n')
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            if trailing_newline {
+                let _ = lines.pop();
+            }
+            FileMutationState {
+                original,
+                lines,
+                trailing_newline,
+                injections: Vec::new(),
+            }
+        });
+
+        if state.original.is_empty() && !full_path.exists() {
+            results[idx] = Some(MutationResult {
+                mutation,
+                outcome: MutationOutcome::BuildError("Cannot read file".to_string()),
+            });
+            continue;
+        }
+
+        let original_refs = state.lines.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+        let Some(target_line) = find_target_line(
+            &original_refs,
+            mutation.line_number,
+            &mutation.original_line,
+        ) else {
+            let actual = if mutation.line_number > 0 && mutation.line_number <= state.lines.len() {
+                state.lines[mutation.line_number - 1].clone()
+            } else {
+                "<out of range>".to_string()
+            };
+            results[idx] = Some(MutationResult {
+                mutation: mutation.clone(),
+                outcome: MutationOutcome::LineMismatch(format!(
+                    "line {}: expected '{}', found '{}'",
+                    mutation.line_number,
+                    mutation.original_line.trim(),
+                    actual.trim()
+                )),
+            });
+            continue;
+        };
+
+        let target_idx = target_line - 1;
+        let original_line = state.lines[target_idx].clone();
+        let indent = leading_whitespace(&original_line).to_string();
+        let variation_name = format!("morris_plan_{:04}", idx + 1);
+        let variant_name = format!("{variation_name}_1");
+        let mutated_line = if mutation.mutated_line.starts_with(&indent) {
+            mutation.mutated_line.clone()
+        } else {
+            format!("{indent}{}", mutation.mutated_line.trim_start())
+        };
+
+        let block_lines = vec![
+            format!("{indent}/*| {variation_name} */"),
+            original_line,
+            format!("{indent}/*|| {variant_name} */"),
+            format!("{indent}/*|"),
+            mutated_line,
+            format!("{indent}*/"),
+            format!("{indent}/* |*/"),
+        ];
+
+        state.injections.push(FileMutationInjection {
+            target_line,
+            block_lines,
+        });
+
+        prepared.push(PreparedMutation {
+            index: idx,
+            mutation,
+            variant_name,
+        });
+    }
+
+    let mut backups = Vec::new();
+    for (path, state) in &mut file_states {
+        if state.injections.is_empty() {
+            continue;
+        }
+
+        state
+            .injections
+            .sort_by_key(|inj| std::cmp::Reverse(inj.target_line));
+        let mut new_lines = state.lines.clone();
+        for inj in &state.injections {
+            let target = inj.target_line.saturating_sub(1);
+            if target < new_lines.len() {
+                new_lines.splice(target..=target, inj.block_lines.clone());
+            }
+        }
+
+        let mut rewritten = new_lines.join("\n");
+        if state.trailing_newline {
+            rewritten.push('\n');
+        }
+
+        backups.push((path.clone(), state.original.clone()));
+        if let Err(e) = std::fs::write(path, rewritten) {
+            for pending in prepared
+                .iter()
+                .filter(|p| p.mutation.file_path == to_display_path(cwd, path))
+            {
+                results[pending.index] = Some(MutationResult {
+                    mutation: pending.mutation.clone(),
+                    outcome: MutationOutcome::BuildError(format!(
+                        "Cannot write mutation file: {e}"
+                    )),
+                });
+            }
+        }
+    }
+
+    PreparedMutationSuite {
+        backups,
+        prepared,
+        results,
+    }
+}
+
+fn restore_mutation_suite(suite: &PreparedMutationSuite) {
+    for (path, content) in &suite.backups {
+        let _ = std::fs::write(path, content);
+    }
+}
+
 /// Run all mutations and collect results.
 async fn run_mutations(
     cwd: &Path,
@@ -348,6 +542,7 @@ async fn run_mutations(
     timeout: Duration,
 ) -> Vec<MutationResult> {
     let mut results = Vec::new();
+    let total = mutations.len();
     for (i, mutation) in mutations.into_iter().enumerate() {
         let full_path = cwd.join(&mutation.file_path);
         let file_path_str = full_path.to_str().unwrap_or(&mutation.file_path);
@@ -355,13 +550,14 @@ async fn run_mutations(
         eprint!(
             "   [{}/{}] {}:{} - {}... ",
             i + 1,
-            results.len() + 1,
+            total,
             mutation.file_path,
             mutation.line_number,
             mutation.description
         );
 
         let outcome = test_line_mutation(
+            cwd,
             file_path_str,
             mutation.line_number,
             &mutation.original_line,
@@ -384,21 +580,118 @@ async fn run_mutations(
     results
 }
 
+/// Run all structured variants by setting one variant at a time.
+async fn run_structured_mutations(
+    cwd: &Path,
+    mutations: Vec<Mutation>,
+    timeout: Duration,
+) -> Vec<MutationResult> {
+    let mut suite = prepare_mutation_suite(cwd, mutations);
+    let total = suite.prepared.len();
+
+    if total == 0 {
+        return suite
+            .results
+            .into_iter()
+            .flatten()
+            .collect::<Vec<MutationResult>>();
+    }
+
+    let mut project = match marauders::Project::new(cwd, None) {
+        Ok(project) => project,
+        Err(_) => {
+            restore_mutation_suite(&suite);
+            let fallback_mutations = suite
+                .prepared
+                .iter()
+                .map(|p| p.mutation.clone())
+                .collect::<Vec<_>>();
+            let fallback_results = run_mutations(cwd, fallback_mutations, timeout).await;
+            for (prepared, result) in suite.prepared.iter().zip(fallback_results) {
+                suite.results[prepared.index] = Some(result);
+            }
+            return suite.results.into_iter().flatten().collect();
+        }
+    };
+
+    let _ = mutation_api::reset_all(&mut project);
+
+    for (i, prepared) in suite.prepared.iter().enumerate() {
+        let variant = prepared.variant_name.clone();
+        let mutation = prepared.mutation.clone();
+        eprint!(
+            "   [{}/{}] {}:{} - {}... ",
+            i + 1,
+            total,
+            mutation.file_path,
+            mutation.line_number,
+            mutation.description
+        );
+
+        let outcome = match mutation_api::set_variant(&mut project, &variant) {
+            Ok(_) => {
+                let (success, _, output) = run_cargo_test(cwd, timeout).await;
+                if output == "TIMEOUT" {
+                    MutationOutcome::Timeout
+                } else if success {
+                    MutationOutcome::Survived
+                } else if output.contains("error[E") || output.contains("could not compile") {
+                    MutationOutcome::BuildError("compilation failed".to_string())
+                } else {
+                    MutationOutcome::Killed
+                }
+            }
+            Err(e) => MutationOutcome::BuildError(format!("variant activation failed: {e}")),
+        };
+
+        let icon = match &outcome {
+            MutationOutcome::Survived => "❌ SURVIVED",
+            MutationOutcome::Killed => "✅ KILLED",
+            MutationOutcome::Timeout => "⏱️  TIMEOUT",
+            MutationOutcome::BuildError(_) => "🔧 BUILD ERROR",
+            MutationOutcome::LineMismatch(_) => "⚠️  LINE MISMATCH",
+        };
+        eprintln!("{icon}");
+
+        if mutation_api::unset_variant(&mut project, &variant).is_err() {
+            let _ = mutation_api::reset_all(&mut project);
+        }
+
+        suite.results[prepared.index] = Some(MutationResult { mutation, outcome });
+    }
+
+    let _ = mutation_api::reset_all(&mut project);
+    restore_mutation_suite(&suite);
+    suite.results.into_iter().flatten().collect()
+}
+
 /// Format mutation results into a summary string.
 fn format_results_summary(results: &[MutationResult]) -> String {
     use std::fmt::Write;
     let mut summary = String::new();
     for r in results {
-        let _ = writeln!(
-            summary,
-            "- {}:{} [{}] {} | {} → {}",
-            r.mutation.file_path,
-            r.mutation.line_number,
-            r.outcome,
-            r.mutation.description,
-            r.mutation.original_line.trim(),
-            r.mutation.mutated_line.trim(),
-        );
+        if r.mutation.original_line.is_empty() {
+            let _ = writeln!(
+                summary,
+                "- {}:{} [{}] {} | variant={}",
+                r.mutation.file_path,
+                r.mutation.line_number,
+                r.outcome,
+                r.mutation.description,
+                r.mutation.mutated_line.trim(),
+            );
+        } else {
+            let _ = writeln!(
+                summary,
+                "- {}:{} [{}] {} | {} → {}",
+                r.mutation.file_path,
+                r.mutation.line_number,
+                r.outcome,
+                r.mutation.description,
+                r.mutation.original_line.trim(),
+                r.mutation.mutated_line.trim(),
+            );
+        }
     }
     summary
 }
@@ -473,7 +766,7 @@ async fn auto_apply(
     }
 
     eprintln!("   Verifying tests...");
-    let (ok, _, output) = run_cargo_test(test_timeout).await;
+    let (ok, _, output) = run_cargo_test(cwd, test_timeout).await;
     if ok {
         eprintln!("   ✅ All tests pass with improvements!");
     } else {
@@ -534,7 +827,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 3: Run baseline tests
     eprintln!("⏱️  Running baseline tests...");
     let (baseline_ok, baseline_duration, baseline_output) =
-        run_cargo_test(Duration::from_secs(300)).await;
+        run_cargo_test(&cwd, Duration::from_secs(300)).await;
     if !baseline_ok {
         eprintln!("❌ Baseline tests failed! Fix your tests first.\n{baseline_output}");
         return Ok(());
@@ -550,7 +843,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("\n🧬 Asking AI for mutation plan...");
     let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
-
     let plan_text = converse(
         &bedrock,
         model_id,
@@ -558,17 +850,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &build_mutation_prompt(&file_contents),
     )
     .await?;
-
     debug!("AI mutation plan: {plan_text}");
-
     let plan: MutationPlan = serde_json::from_str(strip_code_fences(&plan_text))
         .map_err(|e| format!("Failed to parse mutation plan: {e}\nRaw response:\n{plan_text}"))?;
 
     eprintln!("   Got {} mutations", plan.mutations.len());
-
-    // Step 5: Test each mutation
     eprintln!("\n🧪 Testing mutations...\n");
-    let results = run_mutations(&cwd, plan.mutations, test_timeout).await;
+    let results = run_structured_mutations(&cwd, plan.mutations, test_timeout).await;
 
     // Step 6: Summarize results
     let survived_count = results
@@ -740,7 +1028,7 @@ mod tests {
     async fn test_run_cargo_test_timeout() {
         // This just verifies the timeout mechanism works - it won't actually
         // run cargo test successfully outside a real project
-        let (_, _, output) = run_cargo_test(Duration::from_millis(1)).await;
+        let (_, _, output) = run_cargo_test(Path::new("."), Duration::from_millis(1)).await;
         // Either times out or fails fast - both are fine
         assert!(!output.is_empty());
     }
@@ -751,6 +1039,7 @@ mod tests {
         std::fs::write(&temp, "fn test() {\n    let x = 1;\n}\n").unwrap();
 
         let _ = test_line_mutation(
+            Path::new("."),
             temp.to_str().unwrap(),
             2,
             "    let x = 1;",
@@ -770,6 +1059,7 @@ mod tests {
         std::fs::write(&temp, "fn test() {\n    let x = 1;\n}\n").unwrap();
 
         let outcome = test_line_mutation(
+            Path::new("."),
             temp.to_str().unwrap(),
             2,
             "    let x = 999;",
@@ -846,12 +1136,67 @@ mod tests {
         assert_ne!(timeout2, Duration::from_secs(40));
     }
 
+    #[test]
+    fn test_to_display_path() {
+        let cwd = Path::new("/tmp/work");
+        let child = Path::new("/tmp/work/src/lib.rs");
+        let outside = Path::new("/opt/other.rs");
+        assert_eq!(to_display_path(cwd, child), "src/lib.rs");
+        assert_eq!(to_display_path(cwd, outside), "/opt/other.rs");
+    }
+
+    #[tokio::test]
+    async fn test_structured_mutation_handoff_and_restore() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = std::env::temp_dir().join(format!(
+            "morris_handoff_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let src_dir = fixture.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            fixture.join("Cargo.toml"),
+            "[package]\nname = \"morris_handoff\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let original = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn adds() {\n        assert_eq!(add(2, 3), 5);\n    }\n}\n";
+        let lib_path = src_dir.join("lib.rs");
+        std::fs::write(&lib_path, original).unwrap();
+
+        let mock_mutations = vec![Mutation {
+            file_path: "src/lib.rs".to_string(),
+            line_number: 2,
+            original_line: "    a + b".to_string(),
+            mutated_line: "    a - b".to_string(),
+            description: "mock handoff mutation".to_string(),
+        }];
+
+        let results =
+            run_structured_mutations(&fixture, mock_mutations, Duration::from_secs(30)).await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0].outcome, MutationOutcome::Killed),
+            "expected KILLED, got {}",
+            results[0].outcome
+        );
+
+        let restored = std::fs::read_to_string(&lib_path).unwrap();
+        assert_eq!(restored, original, "source must be restored after mutation run");
+
+        std::fs::remove_dir_all(&fixture).unwrap();
+    }
+
     #[tokio::test]
     async fn test_line_mutation_mismatch_last_line() {
         let temp = std::env::temp_dir().join("morris_test_mismatch_last.rs");
         std::fs::write(&temp, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
 
         let outcome = test_line_mutation(
+            Path::new("."),
             temp.to_str().unwrap(),
             3,
             "fn WRONG() {}",
