@@ -80,6 +80,9 @@ struct Config {
     /// Enable debug logging
     #[arg(short, long)]
     verbose: bool,
+    /// Number of mutations to request (default: 5-8)
+    #[arg(short = 'n', long)]
+    mutations: Option<usize>,
     /// Source files or directories to test (default: all of src/)
     #[arg()]
     paths: Vec<PathBuf>,
@@ -345,9 +348,9 @@ fn read_all_sources(
 }
 
 /// Build the prompt asking the AI for a mutation plan.
-fn build_mutation_prompt(file_contents: &str) -> String {
+fn build_mutation_prompt(file_contents: &str, mutation_count: &str) -> String {
     format!(
-        "Analyze this Rust project and propose 5-8 strategic single-line mutations that are \
+        "Analyze this Rust project and propose {mutation_count} strategic single-line mutations that are \
          likely to survive the existing test suite (i.e., reveal test coverage gaps).\n\n\
          Focus on:\n\
          - Boundary conditions (>, <, >=, <=)\n\
@@ -582,6 +585,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Step 4: Ask AI for mutation plan
+    let mutation_count_str = match config.mutations {
+        Some(n) => format!("exactly {n}"),
+        None => "5-8".to_string(),
+    };
+
     eprintln!("\n🧬 Asking AI for mutation plan...");
     let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
@@ -590,7 +598,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &bedrock,
         model_id,
         "You are a mutation testing expert for Rust. Respond only with valid JSON.",
-        &build_mutation_prompt(&file_contents),
+        &build_mutation_prompt(&file_contents, &mutation_count_str),
     )
     .await?;
 
