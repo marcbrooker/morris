@@ -122,11 +122,20 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Resolve user-provided paths into a sorted list of `.rs` files.
-fn filter_source_files(cwd: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+fn filter_source_files(
+    cwd: &Path,
+    paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
     for p in paths {
-        let abs = if p.is_absolute() { p.clone() } else { cwd.join(p) };
-        let abs = abs.canonicalize().map_err(|e| format!("{}: {e}", p.display()))?;
+        let abs = if p.is_absolute() {
+            p.clone()
+        } else {
+            cwd.join(p)
+        };
+        let abs = abs
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", p.display()))?;
         if abs.is_dir() {
             collect_rs_files(&abs, &mut files);
         } else if abs.extension().and_then(|s| s.to_str()) == Some("rs") {
