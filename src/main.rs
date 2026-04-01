@@ -98,14 +98,29 @@ impl Config {
     }
 }
 
-/// Discover all `.rs` files under `src/` recursively.
+/// Discover all `.rs` files under `src/` and `crates/*/src/` recursively.
 fn list_source_files(base: &Path) -> Vec<PathBuf> {
-    let src = base.join("src");
-    if !src.exists() {
-        return Vec::new();
-    }
     let mut files = Vec::new();
-    collect_rs_files(&src, &mut files);
+
+    // Direct src/ directory
+    let src = base.join("src");
+    if src.exists() {
+        collect_rs_files(&src, &mut files);
+    }
+
+    // Workspace: crates/*/src/
+    let crates = base.join("crates");
+    if crates.exists() {
+        if let Ok(entries) = std::fs::read_dir(&crates) {
+            for entry in entries.flatten() {
+                let src = entry.path().join("src");
+                if src.exists() {
+                    collect_rs_files(&src, &mut files);
+                }
+            }
+        }
+    }
+
     files.sort();
     files
 }
